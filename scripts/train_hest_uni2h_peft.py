@@ -172,7 +172,7 @@ def safe_filter_housekeeping(adata: sc.AnnData, species_key: str, unify: bool, a
         var_upper_to_orig = {g.upper(): g for g in var_list}
         inter_upper = hk_upper.intersection(set(var_upper_to_orig.keys()))
         if len(inter_upper) == 0:
-            # Try to convert Ensembl IDs to gene symbols via biomart
+            # Try to convert Ensembl IDs (with/without version suffix) to gene symbols via biomart
             try:
                 adata = map_ensembl_to_gene_symbols(adata, species_key)
                 var_list = list(map(str, adata.var_names.astype(str)))
@@ -188,7 +188,8 @@ def safe_filter_housekeeping(adata: sc.AnnData, species_key: str, unify: bool, a
             inter_upper = hk_upper.intersection(set(var_upper_to_orig.keys()))
 
         if len(inter_upper) == 0:
-            raise ValueError(f"No housekeeping genes found in adata after fallback. Original error: {e}")
+            # Return empty gene space to allow caller to skip this sample gracefully
+            return adata[:, []].copy()
 
         present_orig = sorted([var_upper_to_orig[u] for u in inter_upper])
         return adata[:, present_orig].copy()
@@ -201,11 +202,16 @@ def map_ensembl_to_gene_symbols(adata: sc.AnnData, species_key: str) -> sc.AnnDa
     import scanpy as sc
     org = 'hsapiens' if species_key.lower() == 'human' else 'mmusculus'
     ann = sc.queries.biomart_annotations(org=org, attrs=['ensembl_gene_id', 'external_gene_name'], use_cache=True)
-    mapping = dict(zip(ann['ensembl_gene_id'].astype(str), ann['external_gene_name'].astype(str)))
+    # include entries without version suffix
+    ens_to_sym = dict(zip(ann['ensembl_gene_id'].astype(str), ann['external_gene_name'].astype(str)))
     var = adata.var_names.astype(str)
     new_names = []
     for g in var:
-        new_names.append(mapping.get(g, g))
+        base = g.split('.')[0]
+        sym = ens_to_sym.get(g)
+        if sym is None:
+            sym = ens_to_sym.get(base)
+        new_names.append(sym if sym is not None else g)
     adata = adata.copy()
     adata.var_names = new_names
     # Deduplicate
