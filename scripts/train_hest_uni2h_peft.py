@@ -44,6 +44,7 @@ from tqdm import tqdm
 
 # HEST APIs
 import hest
+from hest.HESTData import unify_gene_names
 from hest.batch_effect import (
     filter_housekeeping,
     filter_stromal_housekeeping,
@@ -159,8 +160,8 @@ def safe_filter_housekeeping(adata: sc.AnnData, species_key: str, unify: bool, a
     2) Try hest.filter_housekeeping; if it fails due to missing genes, fallback to intersection-based filtering
     """
     if unify:
-        # hest.unify_gene_names expects 'human' or 'mouse'
-        adata = hest.unify_gene_names(adata, "human" if species_key.lower() == "human" else "mouse")
+        # unify_gene_names expects 'human' or 'mouse'
+        adata = unify_gene_names(adata, "human" if species_key.lower() == "human" else "mouse")
     try:
         return filter_housekeeping(adata, species='human' if species_key.lower() == 'human' else 'mouse')
     except Exception as e:
@@ -181,7 +182,7 @@ def safe_filter_housekeeping(adata: sc.AnnData, species_key: str, unify: bool, a
                 inter_upper = set()
         if len(inter_upper) == 0 and unify:
             # As a last resort, unify aliases then intersect again
-            adata = hest.unify_gene_names(adata, 'human' if species_key.lower() == 'human' else 'mouse')
+            adata = unify_gene_names(adata, 'human' if species_key.lower() == 'human' else 'mouse')
             var_list = list(map(str, adata.var_names.astype(str)))
             var_upper_to_orig = {g.upper(): g for g in var_list}
             inter_upper = hk_upper.intersection(set(var_upper_to_orig.keys()))
