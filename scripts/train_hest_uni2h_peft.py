@@ -960,6 +960,11 @@ def main():
     # Multi-GPU
     parser.add_argument("--world_size", type=int, default=1)
 
+    # Benchmark-style loader and gene list
+    parser.add_argument("--use_bench_loader", action="store_true", help="Use H5HESTDataset + load_adata flow like HEST benchmark")
+    parser.add_argument("--gene_list", type=str, default=None, help="Path to JSON list of genes (e.g., var_50genes.json). If absent, compute common genes.")
+    parser.add_argument("--target_gene_count", type=int, default=None, help="Optional cap on number of genes in global list")
+
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
