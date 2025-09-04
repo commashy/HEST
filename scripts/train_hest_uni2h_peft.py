@@ -505,30 +505,44 @@ def main_worker(rank: int, world_size: int, args):
         # Shard samples by rank
         sample_ids = sample_ids[rank::world_size]
 
-        # Compute st_dim as max num genes across selected samples
-        def get_nvars(id_):
-            path = os.path.join(args.data_root, 'st', f'{id_}.h5ad')
-            ad = sc.read_h5ad(path, backed='r')
-            n = ad.n_vars
-            ad.file.close()
-            return n
-        try:
-            if rank == 0:
+        # Determine global gene list for consistent output dimension
+        def read_var_names(h5ad_path: str) -> List[str]:
+            ad = sc.read_h5ad(h5ad_path, backed='r')
+            names = list(map(str, ad.var_names))
+            try:
+                ad.file.close()
+            except Exception:
+                pass
+            return names
+
+        global_genes_path = os.path.join(args.output_dir, "bench_genes.json")
+        if rank == 0:
+            if args.gene_list is not None and os.path.exists(args.gene_list):
+                with open(args.gene_list, 'r') as f:
+                    gg = json.load(f)
+                if not isinstance(gg, list):
+                    raise ValueError("--gene_list must be a JSON list of gene symbols")
+                global_genes = list(map(str, gg))
+            else:
+                # Compute intersection across all selected samples (pre-sharding so all ranks share the same list)
                 meta_df_all = read_hest_metadata(args.assets_dir, args.data_root)
                 all_ids = select_samples(meta_df_all, args.technology, args.species, args.max_samples)
-                max_dim = 0
+                common_set = None
                 for sid in all_ids:
-                    n = get_nvars(sid)
-                    if n > max_dim:
-                        max_dim = n
-                with open(os.path.join(args.output_dir, "bench_st_dim.json"), "w") as f:
-                    json.dump({"st_dim": max_dim}, f)
-            if world_size > 1:
-                dist.barrier()
-            with open(os.path.join(args.output_dir, "bench_st_dim.json"), "r") as f:
-                st_dim = json.load(f)["st_dim"]
-        except Exception:
-            st_dim = 2000
+                    vn = set(read_var_names(os.path.join(args.data_root, 'st', f'{sid}.h5ad')))
+                    common_set = vn if common_set is None else (common_set & vn)
+                if not common_set:
+                    raise ValueError("No common genes across selected samples.")
+                global_genes = sorted(list(common_set))
+                if args.target_gene_count is not None and len(global_genes) > args.target_gene_count:
+                    global_genes = global_genes[:args.target_gene_count]
+            with open(global_genes_path, 'w') as f:
+                json.dump(global_genes, f)
+        if world_size > 1:
+            dist.barrier()
+        with open(global_genes_path, 'r') as f:
+            global_genes = json.load(f)
+        st_dim = len(global_genes)
 
         # Transforms
         tmp_model = timm.create_model(args.model_name, pretrained=True, num_classes=0, img_size=224)
@@ -557,13 +571,28 @@ def main_worker(rank: int, world_size: int, args):
             pad = torch.zeros((x.shape[0], dim - x.shape[1]), dtype=x.dtype, device=x.device)
             return torch.cat([x, pad], dim=1)
 
+        # Ensure patches for all samples (rank 0 on full list)
+        if rank == 0 and args.prepare_patches:
+            meta_df_all = read_hest_metadata(args.assets_dir, args.data_root)
+            all_ids = select_samples(meta_df_all, args.technology, args.species, args.max_samples)
+            patch_root = os.path.join(args.output_dir, 'patches')
+            os.makedirs(patch_root, exist_ok=True)
+            for sid in all_ids:
+                try:
+                    st = hest.load_hest(args.data_root, id_list=[sid])[0]
+                    ensure_patches(st, patch_root, args.patch_size, args.patch_pixel_size_um)
+                except Exception:
+                    continue
+        if world_size > 1:
+            dist.barrier()
+
         # Train epochs by iterating samples and using H5HESTDataset chunking
         for epoch in range(args.epochs):
             model.train()
             running = 0.0
             steps = 0
             for sid in sample_ids:
-                patch_h5 = os.path.join(args.output_dir, 'patches', f'{sid}.h5') if args.prepare_patches else os.path.join(args.output_dir, 'patches', f'{sid}.h5')
+                patch_h5 = os.path.join(args.output_dir, 'patches', f'{sid}.h5')
                 if not os.path.exists(patch_h5):
                     # If not generated, fall back to generating now on this rank
                     try:
@@ -580,9 +609,13 @@ def main_worker(rank: int, world_size: int, args):
                 # Load full expressions once per sample
                 expr_df = load_adata(expr_h5ad, normalize=args.log1p)
                 expr_df.index = expr_df.index.astype(str)
+                # Align to global gene order, fill missing genes with 0
+                expr_df = expr_df.reindex(columns=global_genes, fill_value=0.0)
 
                 for chunk in tile_loader:
-                    imgs_np = chunk['imgs'].squeeze(0).numpy() if hasattr(chunk['imgs'], 'numpy') else chunk['imgs'].squeeze(0)
+                    imgs_np = chunk['imgs'].squeeze(0)
+                    if hasattr(imgs_np, 'numpy'):
+                        imgs_np = imgs_np.numpy()
                     barcodes_arr = chunk['barcodes']
                     # decode barcodes
                     barcodes = []
@@ -591,7 +624,8 @@ def main_worker(rank: int, world_size: int, args):
                         barcodes.append(b0.decode() if isinstance(b0, (bytes, bytearray)) else str(b0))
 
                     # Select expressions, drop missing barcodes
-                    sel = expr_df.reindex(barcodes).dropna(axis=0, how='any')
+                    sel = expr_df.reindex(barcodes)
+                    sel = sel.dropna(axis=0, how='any')
                     if len(sel) == 0:
                         continue
                     # Filter images/barcodes to those present
@@ -602,12 +636,13 @@ def main_worker(rank: int, world_size: int, args):
                     imgs_t = torch.stack([transform(Image.fromarray(img)) for img in imgs_np]).to(device, non_blocking=True)
 
                     targets = torch.tensor(sel.values, dtype=torch.float32, device=device)
-                    targets = pad_targets(targets, st_dim)
 
                     optimizer.zero_grad(set_to_none=True)
                     with torch.cuda.amp.autocast():
                         preds = model(imgs_t)
-                        preds = preds[:, :targets.shape[1]]
+                        # Ensure pred dim matches st_dim and reorder as global_genes
+                        if preds.shape[1] != st_dim:
+                            preds = preds[:, :st_dim] if preds.shape[1] > st_dim else torch.cat([preds, torch.zeros((preds.shape[0], st_dim - preds.shape[1]), device=preds.device, dtype=preds.dtype)], dim=1)
                         loss = F.mse_loss(preds, targets)
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
