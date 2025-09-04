@@ -164,12 +164,53 @@ def safe_filter_housekeeping(adata: sc.AnnData, species_key: str, unify: bool, a
     try:
         return filter_housekeeping(adata, species='human' if species_key.lower() == 'human' else 'mouse')
     except Exception as e:
-        # Fallback: intersect with provided list
-        hk = set(get_housekeeping_genes(assets_dir, species_key))
-        present = hk.intersection(set(adata.var_names.astype(str)))
-        if len(present) == 0:
+        # Fallback: case-insensitive intersection and Ensembl->symbol remap if needed
+        hk_list = get_housekeeping_genes(assets_dir, species_key)
+        hk_upper = {g.upper() for g in hk_list}
+        var_list = list(map(str, adata.var_names.astype(str)))
+        var_upper_to_orig = {g.upper(): g for g in var_list}
+        inter_upper = hk_upper.intersection(set(var_upper_to_orig.keys()))
+        if len(inter_upper) == 0:
+            # Try to convert Ensembl IDs to gene symbols via biomart
+            try:
+                adata = map_ensembl_to_gene_symbols(adata, species_key)
+                var_list = list(map(str, adata.var_names.astype(str)))
+                var_upper_to_orig = {g.upper(): g for g in var_list}
+                inter_upper = hk_upper.intersection(set(var_upper_to_orig.keys()))
+            except Exception:
+                inter_upper = set()
+        if len(inter_upper) == 0 and unify:
+            # As a last resort, unify aliases then intersect again
+            adata = hest.unify_gene_names(adata, 'human' if species_key.lower() == 'human' else 'mouse')
+            var_list = list(map(str, adata.var_names.astype(str)))
+            var_upper_to_orig = {g.upper(): g for g in var_list}
+            inter_upper = hk_upper.intersection(set(var_upper_to_orig.keys()))
+
+        if len(inter_upper) == 0:
             raise ValueError(f"No housekeeping genes found in adata after fallback. Original error: {e}")
-        return adata[:, sorted(list(present))].copy()
+
+        present_orig = sorted([var_upper_to_orig[u] for u in inter_upper])
+        return adata[:, present_orig].copy()
+
+
+def map_ensembl_to_gene_symbols(adata: sc.AnnData, species_key: str) -> sc.AnnData:
+    """Replace var_names from Ensembl IDs to gene symbols using scanpy biomart annotations.
+    Keeps original names when mapping is missing. Deduplicates by keeping first occurrence.
+    """
+    import scanpy as sc
+    org = 'hsapiens' if species_key.lower() == 'human' else 'mmusculus'
+    ann = sc.queries.biomart_annotations(org=org, attrs=['ensembl_gene_id', 'external_gene_name'], use_cache=True)
+    mapping = dict(zip(ann['ensembl_gene_id'].astype(str), ann['external_gene_name'].astype(str)))
+    var = adata.var_names.astype(str)
+    new_names = []
+    for g in var:
+        new_names.append(mapping.get(g, g))
+    adata = adata.copy()
+    adata.var_names = new_names
+    # Deduplicate
+    mask = ~pd.Index(adata.var_names).duplicated(keep='first')
+    adata = adata[:, mask]
+    return adata
 
 
 class HESTPatchSTDataset(Dataset):
@@ -443,112 +484,135 @@ def main_worker(rank: int, world_size: int, args):
     expr_dir = os.path.join(shared_dir, "expr")
     os.makedirs(expr_dir, exist_ok=True)
 
-    # 1) Select samples from metadata (rank 0)
-    if rank == 0:
-        meta_df = read_hest_metadata(args.assets_dir, args.data_root)
-        sample_ids = select_samples(meta_df, args.technology, args.species, args.max_samples)
-        with open(os.path.join(shared_dir, "sample_ids.json"), "w") as f:
-            json.dump(sample_ids, f)
-    if world_size > 1:
-        dist.barrier()
-    if rank != 0:
+    try:
+        # 1) Select samples from metadata (rank 0)
+        if rank == 0:
+            meta_df = read_hest_metadata(args.assets_dir, args.data_root)
+            sample_ids = select_samples(meta_df, args.technology, args.species, args.max_samples)
+            with open(os.path.join(shared_dir, "sample_ids.json"), "w") as f:
+                json.dump(sample_ids, f)
+        if world_size > 1:
+            dist.barrier()
+        if rank != 0:
+            with open(os.path.join(shared_dir, "sample_ids.json"), "r") as f:
+                sample_ids = json.load(f)
+
+        # 2) Load samples and preprocess ONLY on rank 0; save per-sample expressions to parquet
+        if rank == 0:
+            print(f"Loading {len(sample_ids)} samples via HEST...")
+            st_list: List[hest.HESTData] = hest.load_hest(args.data_root, id_list=sample_ids)
+            id_to_hest: Dict[str, hest.HESTData] = {st.meta["id"]: st for st in st_list}
+
+            common_gene_set: Optional[set] = None
+            kept_ids: List[str] = []
+            for sid in sample_ids:
+                st = id_to_hest[sid]
+                species_key = "human" if st.meta.get("species", "Homo sapiens") == "Homo sapiens" else "mouse"
+
+                if args.use_stromal:
+                    ad = filter_stromal_housekeeping(
+                        st,
+                        species=species_key,
+                        whole_tissue=not args.only_stroma,
+                        unify_genes=args.unify_genes,
+                        verbose=False,
+                    )
+                else:
+                    ad = safe_filter_housekeeping(st.adata, species_key, unify=args.unify_genes, assets_dir=args.assets_dir)
+
+                if args.log1p:
+                    sc.pp.log1p(ad)
+
+                if ad.shape[1] == 0:
+                    print(f"[rank0] Skipping sample {sid}: no housekeeping genes found after normalization/mapping.")
+                    continue
+                genes = list(map(str, ad.var_names.tolist()))
+                common_gene_set = set(genes) if common_gene_set is None else (common_gene_set & set(genes))
+                kept_ids.append(sid)
+
+            if not kept_ids:
+                raise ValueError("All samples were filtered out: no housekeeping overlap. Check species/genes.")
+            sample_ids = kept_ids
+            with open(os.path.join(shared_dir, "sample_ids.json"), "w") as f:
+                json.dump(sample_ids, f)
+            if not common_gene_set or len(common_gene_set) == 0:
+                raise ValueError("No common genes across kept samples after preprocessing.")
+            common_genes = sorted(list(common_gene_set))
+            with open(os.path.join(shared_dir, "gene_order.json"), "w") as f:
+                json.dump(common_genes, f)
+
+            # Save aligned expressions to parquet per kept sample
+            for sid in sample_ids:
+                st = id_to_hest[sid]
+                species_key = "human" if st.meta.get("species", "Homo sapiens") == "Homo sapiens" else "mouse"
+                if args.use_stromal:
+                    ad = filter_stromal_housekeeping(
+                        st,
+                        species=species_key,
+                        whole_tissue=not args.only_stroma,
+                        unify_genes=args.unify_genes,
+                        verbose=False,
+                    )
+                else:
+                    ad = safe_filter_housekeeping(st.adata, species_key, unify=args.unify_genes, assets_dir=args.assets_dir)
+                if args.log1p:
+                    sc.pp.log1p(ad)
+                ad = ad[:, common_genes]
+                df = ad.to_df()
+                df.to_parquet(os.path.join(expr_dir, f"{sid}.parquet"))
+
+            # Optional batch correction across samples
+            if args.batch_correction != "none":
+                print(f"Applying batch correction: {args.batch_correction}")
+                adatas = []
+                for sid in sample_ids:
+                    df = pd.read_parquet(os.path.join(expr_dir, f"{sid}.parquet"))
+                    ad = sc.AnnData(df.values)
+                    ad.var_names = list(df.columns)
+                    ad.obs_names = list(df.index)
+                    adatas.append(ad)
+                adatas = correct_batch_effect(adatas, method=args.batch_correction)
+                for sid, ad in zip(sample_ids, adatas):
+                    pd.DataFrame(ad.X, index=ad.obs_names, columns=ad.var_names).to_parquet(os.path.join(expr_dir, f"{sid}.parquet"))
+
+            # Ensure patches exist (rank 0)
+            patch_dir = os.path.join(args.output_dir, "patches")
+            os.makedirs(patch_dir, exist_ok=True)
+            if args.prepare_patches:
+                print("Ensuring patch files exist (this may take time on first run)...")
+            for sid in sample_ids:
+                if args.prepare_patches:
+                    ensure_patches(id_to_hest[sid], patch_dir, args.patch_size, args.patch_pixel_size_um)
+            with open(os.path.join(shared_dir, "patch_dir.json"), "w") as f:
+                json.dump({"patch_dir": patch_dir}, f)
+
+        # Sync before loading artifacts on other ranks
+        if world_size > 1:
+            dist.barrier()
+
+        # Load shared artifacts
         with open(os.path.join(shared_dir, "sample_ids.json"), "r") as f:
             sample_ids = json.load(f)
+        with open(os.path.join(shared_dir, "gene_order.json"), "r") as f:
+            common_genes = json.load(f)
+        with open(os.path.join(shared_dir, "patch_dir.json"), "r") as f:
+            patch_dir = json.load(f)["patch_dir"]
+        st_dim = len(common_genes)
+        id_to_patch_path = {sid: os.path.join(patch_dir, f"{sid}.h5") for sid in sample_ids}
 
-    # 2) Load samples and preprocess ONLY on rank 0; save per-sample expressions to parquet
-    if rank == 0:
-        print(f"Loading {len(sample_ids)} samples via HEST...")
-        st_list: List[hest.HESTData] = hest.load_hest(args.data_root, id_list=sample_ids)
-        id_to_hest: Dict[str, hest.HESTData] = {st.meta["id"]: st for st in st_list}
-
-        common_gene_set: Optional[set] = None
-        gene_orders: Dict[str, List[str]] = {}
-        for sid in sample_ids:
-            st = id_to_hest[sid]
-            species_key = "human" if st.meta.get("species", "Homo sapiens") == "Homo sapiens" else "mouse"
-
-            if args.use_stromal:
-                ad = filter_stromal_housekeeping(
-                    st,
-                    species=species_key,
-                    whole_tissue=not args.only_stroma,
-                    unify_genes=args.unify_genes,
-                    verbose=False,
-                )
-            else:
-                ad = safe_filter_housekeeping(st.adata, species_key, unify=args.unify_genes, assets_dir=args.assets_dir)
-
-            if args.log1p:
-                sc.pp.log1p(ad)
-
-            genes = list(map(str, ad.var_names.tolist()))
-            gene_orders[sid] = genes
-            common_gene_set = set(genes) if common_gene_set is None else (common_gene_set & set(genes))
-
-        if not common_gene_set or len(common_gene_set) == 0:
-            raise ValueError("No common genes across selected samples after preprocessing.")
-        common_genes = sorted(list(common_gene_set))
-        with open(os.path.join(shared_dir, "gene_order.json"), "w") as f:
-            json.dump(common_genes, f)
-
-        # Re-open and save aligned expressions to parquet per sample
-        for sid in sample_ids:
-            st = id_to_hest[sid]
-            species_key = "human" if st.meta.get("species", "Homo sapiens") == "Homo sapiens" else "mouse"
-            if args.use_stromal:
-                ad = filter_stromal_housekeeping(
-                    st,
-                    species=species_key,
-                    whole_tissue=not args.only_stroma,
-                    unify_genes=args.unify_genes,
-                    verbose=False,
-                )
-            else:
-                ad = safe_filter_housekeeping(st.adata, species_key, unify=args.unify_genes, assets_dir=args.assets_dir)
-            if args.log1p:
-                sc.pp.log1p(ad)
-            ad = ad[:, common_genes]
-            df = ad.to_df()
-            df.to_parquet(os.path.join(expr_dir, f"{sid}.parquet"))
-
-        # Optional batch correction across samples: load all, correct, save back
-        if args.batch_correction != "none":
-            print(f"Applying batch correction: {args.batch_correction}")
-            # Load aligned adatas, correct, then overwrite parquet
-            adatas = []
-            for sid in sample_ids:
-                ad = sc.AnnData(pd.read_parquet(os.path.join(expr_dir, f"{sid}.parquet")))
-                ad.var_names = common_genes
-                ad.obs_names = pd.read_parquet(os.path.join(expr_dir, f"{sid}.parquet")).index
-                adatas.append(ad)
-            adatas = correct_batch_effect(adatas, method=args.batch_correction)
-            for sid, ad in zip(sample_ids, adatas):
-                pd.DataFrame(ad.X, index=ad.obs_names, columns=ad.var_names).to_parquet(os.path.join(expr_dir, f"{sid}.parquet"))
-
-        # Ensure patches exist (do it on rank 0 only)
-        patch_dir = os.path.join(args.output_dir, "patches")
-        os.makedirs(patch_dir, exist_ok=True)
-        if args.prepare_patches:
-            print("Ensuring patch files exist (this may take time on first run)...")
-        for sid in sample_ids:
-            if args.prepare_patches:
-                ensure_patches(id_to_hest[sid], patch_dir, args.patch_size, args.patch_pixel_size_um)
-        with open(os.path.join(shared_dir, "patch_dir.json"), "w") as f:
-            json.dump({"patch_dir": patch_dir}, f)
-
-    # Sync before loading artifacts on other ranks
-    if world_size > 1:
-        dist.barrier()
-
-    # Load shared artifacts
-    with open(os.path.join(shared_dir, "sample_ids.json"), "r") as f:
-        sample_ids = json.load(f)
-    with open(os.path.join(shared_dir, "gene_order.json"), "r") as f:
-        common_genes = json.load(f)
-    with open(os.path.join(shared_dir, "patch_dir.json"), "r") as f:
-        patch_dir = json.load(f)["patch_dir"]
-    st_dim = len(common_genes)
-    id_to_patch_path = {sid: os.path.join(patch_dir, f"{sid}.h5") for sid in sample_ids}
+    except Exception as e:
+        if rank == 0:
+            with open(os.path.join(shared_dir, "error.json"), "w") as f:
+                json.dump({"error": str(e)}, f)
+        if world_size > 1:
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+        # Ensure clean shutdown
+        if world_size > 1:
+            cleanup_distributed()
+        raise
 
     # 5) Transforms
     backbone_name = args.model_name
