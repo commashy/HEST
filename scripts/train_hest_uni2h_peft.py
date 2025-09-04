@@ -524,18 +524,38 @@ def main_worker(rank: int, world_size: int, args):
                     raise ValueError("--gene_list must be a JSON list of gene symbols")
                 global_genes = list(map(str, gg))
             else:
-                # Compute intersection across all selected samples (pre-sharding so all ranks share the same list)
+                # Compute frequency across all selected samples and keep genes present in >= min_gene_presence fraction
                 meta_df_all = read_hest_metadata(args.assets_dir, args.data_root)
                 all_ids = select_samples(meta_df_all, args.technology, args.species, args.max_samples)
-                common_set = None
+                from collections import Counter
+                gene_counter = Counter()
+                sample_gene_sets = {}
                 for sid in all_ids:
-                    vn = set(read_var_names(os.path.join(args.data_root, 'st', f'{sid}.h5ad')))
-                    common_set = vn if common_set is None else (common_set & vn)
-                if not common_set:
-                    raise ValueError("No common genes across selected samples.")
-                global_genes = sorted(list(common_set))
-                if args.target_gene_count is not None and len(global_genes) > args.target_gene_count:
-                    global_genes = global_genes[:args.target_gene_count]
+                    genes = set(read_var_names(os.path.join(args.data_root, 'st', f'{sid}.h5ad')))
+                    sample_gene_sets[sid] = genes
+                    gene_counter.update(genes)
+                total_samples = len(all_ids)
+                min_presence = max(0.0, min(1.0, args.min_gene_presence))
+                keep_threshold = int(np.ceil(min_presence * total_samples))
+                candidates = [g for g, c in gene_counter.items() if c >= keep_threshold]
+                if len(candidates) < args.min_gene_count:
+                    # fallback: take top frequent genes
+                    candidates = [g for g, _ in gene_counter.most_common(args.min_gene_count)]
+                candidates = sorted(candidates)
+                if args.target_gene_count is not None and len(candidates) > args.target_gene_count:
+                    candidates = candidates[:args.target_gene_count]
+
+                # Exclude outlier samples that cover too few of the selected genes
+                filtered_ids = []
+                for sid in all_ids:
+                    cov = len(sample_gene_sets[sid].intersection(candidates)) / max(1, len(candidates))
+                    if cov >= args.min_sample_gene_coverage:
+                        filtered_ids.append(sid)
+                if len(filtered_ids) == 0:
+                    raise ValueError("All samples filtered out due to insufficient gene coverage. Relax thresholds.")
+                with open(os.path.join(args.output_dir, "bench_sample_ids.json"), "w") as f:
+                    json.dump(filtered_ids, f)
+                global_genes = candidates
             with open(global_genes_path, 'w') as f:
                 json.dump(global_genes, f)
         if world_size > 1:
@@ -964,6 +984,9 @@ def main():
     parser.add_argument("--use_bench_loader", action="store_true", help="Use H5HESTDataset + load_adata flow like HEST benchmark")
     parser.add_argument("--gene_list", type=str, default=None, help="Path to JSON list of genes (e.g., var_50genes.json). If absent, compute common genes.")
     parser.add_argument("--target_gene_count", type=int, default=None, help="Optional cap on number of genes in global list")
+    parser.add_argument("--min_gene_presence", type=float, default=0.7, help="Fraction of samples a gene must appear in to be kept when auto-generating gene list")
+    parser.add_argument("--min_sample_gene_coverage", type=float, default=0.8, help="Min fraction of global genes a sample must contain to be kept")
+    parser.add_argument("--min_gene_count", type=int, default=500, help="Minimum number of genes to keep when auto-generating (fallback to top by frequency)")
 
     args = parser.parse_args()
 
