@@ -50,6 +50,8 @@ from hest.batch_effect import (
     filter_stromal_housekeeping,
     correct_batch_effect,
 )
+from hest.bench.st_dataset import load_adata
+from hestcore.datasets import H5HESTDataset
 
 
 def setup_wandb(project: str, args) -> bool:
@@ -484,6 +486,146 @@ def main_worker(rank: int, world_size: int, args):
     use_wb = False
     if args.use_wandb and rank == 0:
         use_wb = setup_wandb("uni2h-hest-peft", args)
+
+    # If using benchmark-style loader, go through a different path modeled on HEST's benchmark
+    if args.use_bench_loader:
+        # Prepare sample ids (rank 0) and shard across ranks
+        if rank == 0:
+            meta_df = read_hest_metadata(args.assets_dir, args.data_root)
+            sample_ids = select_samples(meta_df, args.technology, args.species, args.max_samples)
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, "bench_sample_ids.json"), "w") as f:
+                json.dump(sample_ids, f)
+        if world_size > 1:
+            dist.barrier()
+        if rank != 0:
+            with open(os.path.join(args.output_dir, "bench_sample_ids.json"), "r") as f:
+                sample_ids = json.load(f)
+
+        # Shard samples by rank
+        sample_ids = sample_ids[rank::world_size]
+
+        # Compute st_dim as max num genes across selected samples
+        def get_nvars(id_):
+            path = os.path.join(args.data_root, 'st', f'{id_}.h5ad')
+            ad = sc.read_h5ad(path, backed='r')
+            n = ad.n_vars
+            ad.file.close()
+            return n
+        try:
+            if rank == 0:
+                meta_df_all = read_hest_metadata(args.assets_dir, args.data_root)
+                all_ids = select_samples(meta_df_all, args.technology, args.species, args.max_samples)
+                max_dim = 0
+                for sid in all_ids:
+                    n = get_nvars(sid)
+                    if n > max_dim:
+                        max_dim = n
+                with open(os.path.join(args.output_dir, "bench_st_dim.json"), "w") as f:
+                    json.dump({"st_dim": max_dim}, f)
+            if world_size > 1:
+                dist.barrier()
+            with open(os.path.join(args.output_dir, "bench_st_dim.json"), "r") as f:
+                st_dim = json.load(f)["st_dim"]
+        except Exception:
+            st_dim = 2000
+
+        # Transforms
+        tmp_model = timm.create_model(args.model_name, pretrained=True, num_classes=0, img_size=224)
+        data_cfg = resolve_data_config(getattr(tmp_model, "pretrained_cfg", None), model=tmp_model)
+        transform = create_transform(**data_cfg)
+        del tmp_model
+
+        # Model
+        model = UNI2hSTPredictor(backbone_name=args.model_name, st_dim=st_dim, dropout=args.dropout)
+        model.backbone = apply_lora_to_backbone(model.backbone, args.lora_r, args.lora_alpha, args.lora_dropout)
+        model = model.to(device)
+        if world_size > 1:
+            model = DDP(model, device_ids=[rank])
+
+        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
+        # Approximate total steps: sum of ceil(num_patches/bs) over samples. Use a proxy if unknown.
+        total_steps = max(1, 1000) * args.epochs
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=max(1, int(0.1 * total_steps)), num_training_steps=total_steps)
+        scaler = torch.cuda.amp.GradScaler()
+
+        def pad_targets(x: torch.Tensor, dim: int) -> torch.Tensor:
+            if x.shape[1] == dim:
+                return x
+            if x.shape[1] > dim:
+                return x[:, :dim]
+            pad = torch.zeros((x.shape[0], dim - x.shape[1]), dtype=x.dtype, device=x.device)
+            return torch.cat([x, pad], dim=1)
+
+        # Train epochs by iterating samples and using H5HESTDataset chunking
+        for epoch in range(args.epochs):
+            model.train()
+            running = 0.0
+            steps = 0
+            for sid in sample_ids:
+                patch_h5 = os.path.join(args.output_dir, 'patches', f'{sid}.h5') if args.prepare_patches else os.path.join(args.output_dir, 'patches', f'{sid}.h5')
+                if not os.path.exists(patch_h5):
+                    # If not generated, fall back to generating now on this rank
+                    try:
+                        st = hest.load_hest(args.data_root, id_list=[sid])[0]
+                        os.makedirs(os.path.join(args.output_dir, 'patches'), exist_ok=True)
+                        ensure_patches(st, os.path.join(args.output_dir, 'patches'), args.patch_size, args.patch_pixel_size_um)
+                    except Exception:
+                        continue
+                expr_h5ad = os.path.join(args.data_root, 'st', f'{sid}.h5ad')
+
+                tile_dataset = H5HESTDataset(patch_h5, chunk_size=args.batch_size)
+                tile_loader = DataLoader(tile_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+                # Load full expressions once per sample
+                expr_df = load_adata(expr_h5ad, normalize=args.log1p)
+                expr_df.index = expr_df.index.astype(str)
+
+                for chunk in tile_loader:
+                    imgs_np = chunk['imgs'].squeeze(0).numpy() if hasattr(chunk['imgs'], 'numpy') else chunk['imgs'].squeeze(0)
+                    barcodes_arr = chunk['barcodes']
+                    # decode barcodes
+                    barcodes = []
+                    for b in barcodes_arr:
+                        b0 = b[0] if isinstance(b, (list, np.ndarray)) else b
+                        barcodes.append(b0.decode() if isinstance(b0, (bytes, bytearray)) else str(b0))
+
+                    # Select expressions, drop missing barcodes
+                    sel = expr_df.reindex(barcodes).dropna(axis=0, how='any')
+                    if len(sel) == 0:
+                        continue
+                    # Filter images/barcodes to those present
+                    present_mask = [bc in sel.index for bc in barcodes]
+                    imgs_np = imgs_np[present_mask]
+                    # Transform images
+                    from PIL import Image
+                    imgs_t = torch.stack([transform(Image.fromarray(img)) for img in imgs_np]).to(device, non_blocking=True)
+
+                    targets = torch.tensor(sel.values, dtype=torch.float32, device=device)
+                    targets = pad_targets(targets, st_dim)
+
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.cuda.amp.autocast():
+                        preds = model(imgs_t)
+                        preds = preds[:, :targets.shape[1]]
+                        loss = F.mse_loss(preds, targets)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    running += loss.item()
+                    steps += 1
+                    if use_wb and steps % 20 == 0 and rank == 0:
+                        wandb.log({"train/loss": running / max(1, steps), "epoch": epoch})
+
+            if rank == 0:
+                print(f"Epoch {epoch+1}: avg loss {running / max(1, steps):.4f}")
+
+        if args.use_wandb and rank == 0 and wandb.run is not None:
+            wandb.finish()
+        if world_size > 1:
+            cleanup_distributed()
+        return
 
     # Work dir for shared preprocessed artifacts
     shared_dir = os.path.join(args.output_dir, "preprocessed")
